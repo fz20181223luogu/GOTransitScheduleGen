@@ -13,11 +13,17 @@ from collections import defaultdict, deque
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 
-def toposort_from_edges(nodes, edges, coords: Optional[Dict[str, Tuple[float, float]]] = None):
+def toposort_from_edges(
+    nodes,
+    edges,
+    coords: Optional[Dict[str, Tuple[float, float]]] = None,
+    priority_node: Optional[str] = None,
+):
     """Topological sort with global spatial orientation (Option 2 variant).
     
     Identifies the two furthest terminal points as global anchors to resolve
     ordering alignment across multiple starting/ending terminal branches.
+    A prioritized endpoint keeps its unbranched path at the corresponding end.
     """
     adj = defaultdict(set)
     indeg = defaultdict(int)
@@ -81,35 +87,74 @@ def toposort_from_edges(nodes, edges, coords: Optional[Dict[str, Tuple[float, fl
     global_start_coord = coords_map.get(global_start_node) if global_start_node else None
     global_end_coord = coords_map.get(global_end_node) if global_end_node else None
 
-    zero_nodes = [n for n, d in indeg.items() if d == 0]
+    initial_indeg = indeg.copy()
+    predecessors = defaultdict(set)
+    for u, neighbors in adj.items():
+        for v in neighbors:
+            predecessors[v].add(u)
+
+    initial_zero_nodes = [n for n, d in initial_indeg.items() if d == 0]
+    terminal_nodes = [n for n in indeg if not adj[n]]
+    priority_prefix = []
+    priority_suffix = set()
+
+    if priority_node in initial_zero_nodes and len(initial_zero_nodes) > 1:
+        current = priority_node
+        priority_prefix.append(current)
+        while len(adj[current]) == 1:
+            next_node = next(iter(adj[current]))
+            if initial_indeg[next_node] > 1:
+                break
+            priority_prefix.append(next_node)
+            if len(adj[next_node]) > 1:
+                break
+            current = next_node
+    elif priority_node in terminal_nodes and len(terminal_nodes) > 1:
+        current = priority_node
+        priority_suffix.add(current)
+        while len(predecessors[current]) == 1:
+            previous = next(iter(predecessors[current]))
+            if initial_indeg[previous] > 1 or len(adj[previous]) > 1:
+                break
+            priority_suffix.add(previous)
+            current = previous
+
+    zero_nodes = list(initial_zero_nodes)
     topo = []
     
     while zero_nodes:
-        has_spatial_data = coords_map and any(n in coords_map for n in zero_nodes)
-        
-        # FIXED: Changed from pick = sorted(zero_nodes) to extract a single item
-        if len(zero_nodes) == 1 or not has_spatial_data or not global_start_coord:
-            pick = sorted(zero_nodes)[0]
+        if priority_prefix and priority_prefix[0] in zero_nodes:
+            pick = priority_prefix.pop(0)
         else:
-            progress_scores = {}
-            for node in zero_nodes:
-                node_coord = coords_map.get(node)
-                if not node_coord:
-                    progress_scores[node] = float('inf')
-                    continue
+            candidates = zero_nodes
+            non_priority_nodes = [n for n in zero_nodes if n not in priority_suffix]
+            if priority_suffix and non_priority_nodes:
+                candidates = non_priority_nodes
+
+            has_spatial_data = coords_map and any(n in coords_map for n in candidates)
+        
+            if len(candidates) == 1 or not has_spatial_data or not global_start_coord:
+                pick = sorted(candidates)[0]
+            else:
+                progress_scores = {}
+                for node in candidates:
+                    node_coord = coords_map.get(node)
+                    if not node_coord:
+                        progress_scores[node] = float('inf')
+                        continue
+                    
+                    # 2. Score progress based on relative position along the global travel axis
+                    dist_from_start = haversine(global_start_coord, node_coord)
+                    dist_to_end = haversine(node_coord, global_end_coord) if global_end_coord else 0.0
+                    
+                    total_axis_dist = dist_from_start + dist_to_end
+                    if total_axis_dist == 0:
+                        progress_scores[node] = 0.0
+                    else:
+                        progress_scores[node] = dist_from_start / total_axis_dist
                 
-                # 2. Score progress based on relative position along the global travel axis
-                dist_from_start = haversine(global_start_coord, node_coord)
-                dist_to_end = haversine(node_coord, global_end_coord) if global_end_coord else 0.0
-                
-                total_axis_dist = dist_from_start + dist_to_end
-                if total_axis_dist == 0:
-                    progress_scores[node] = 0.0
-                else:
-                    progress_scores[node] = dist_from_start / total_axis_dist
-            
-            # Pop the candidate closest to the global starting terminal
-            pick = min(zero_nodes, key=lambda n: (progress_scores.get(n, float('inf')), n))
+                # Pop the candidate closest to the global starting terminal
+                pick = min(candidates, key=lambda n: (progress_scores.get(n, float('inf')), n))
             
         zero_nodes.remove(pick)
         topo.append(pick)
@@ -296,7 +341,20 @@ def generate_combined_schedule(
         ).to_dict()
 
 
-    ordered_stops = toposort_from_edges(all_stop_ids, edges, coords=stop_coords)
+    union_stop_id = None
+    if feed.stops is not None and {'stop_id', 'stop_name'}.issubset(feed.stops.columns):
+        union_stop_ids = feed.stops.loc[
+            feed.stops['stop_name'].astype(str).str.strip().str.casefold().eq('union station go'),
+            'stop_id',
+        ].astype(str)
+        union_stop_id = next((stop_id for stop_id in union_stop_ids if stop_id in all_stop_ids), None)
+
+    ordered_stops = toposort_from_edges(
+        all_stop_ids,
+        edges,
+        coords=stop_coords,
+        priority_node=union_stop_id,
+    )
     if verbose:
         print(f"[DEBUG] computed station edges: {len(edges)} edges, {len(all_stop_ids)} nodes")
     if ordered_stops is None:
@@ -312,6 +370,7 @@ def generate_combined_schedule(
         except Exception:
             remaining_sorted = sorted(remaining)
         ordered_stops = ordered_stops + remaining_sorted
+
     if verbose:
         print(f"[DEBUG] ordered_stops length={len(ordered_stops)}")
 
@@ -525,13 +584,14 @@ def generate_both_directions(
 
 if __name__ == '__main__':
     # Example usage (adjust target date and pairs as needed)
-    TARGET_DATE = '20260926'
+    TARGET_DATE = '20261025'
     TARGET_PAIRS = [
-        ('09261126-70', 0),
-        ('09261126-71', 0),
-        ('09261126-ST', 0),
+        ('09261126-LW', 1),
+        ('09261126-18', 0),
+        ('09261126-12', 0),
+        # ('09261126-25', 1),
     ]
-    feed = gk.read_feed('GO-GTFS (1).zip', dist_units='km')
+    feed = gk.read_feed('GO-GTFS (3).zip', dist_units='km')
     generate_both_directions(feed, TARGET_DATE, TARGET_PAIRS
                             #  , verbose=True
                              )
