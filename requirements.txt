@@ -1,0 +1,4 @@
+gtfs-kit>=12.3,<13
+pandas>=2.2,<4
+xlsxwriter>=3.2,<4
+reportlab>=4.2,<5
